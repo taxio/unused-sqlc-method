@@ -4,99 +4,92 @@ import (
 	"context"
 	"fmt"
 	"go/ast"
-	"go/parser"
 	"go/token"
 	"go/types"
-	"log"
-	"log/slog"
 	"os"
-	"path/filepath"
-	"strings"
+	"slices"
 
 	"github.com/spf13/cobra"
 	"golang.org/x/tools/go/packages"
 )
 
 func main() {
-	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug})))
-
-	ctx := context.Background()
-	if err := cmd().ExecuteContext(ctx); err != nil {
+	if err := cmd().ExecuteContext(context.Background()); err != nil {
 		fmt.Println(err)
 		os.Exit(1)
 	}
 }
 
 func cmd() *cobra.Command {
-	return &cobra.Command{
-		Use:  "unused-sqlc-method [package path] [struct name] [project path]",
-		Args: cobra.ExactArgs(3),
+	var (
+		fail          *bool
+		ignoreMethods []string
+	)
+	c := &cobra.Command{
+		Use:  "unused-sqlc-method [target package path] [target struct name]",
+		Args: cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return run(cmd.Context(), args[0], args[1], args[2])
+			unusedMethods, err := search(cmd.Context(), args[0], args[1])
+			if err != nil {
+				return err
+			}
+
+			// remove ignored methods
+			if len(ignoreMethods) > 0 {
+				ignoreSet := make(map[string]struct{}, len(ignoreMethods))
+				for _, m := range ignoreMethods {
+					ignoreSet[m] = struct{}{}
+				}
+				var filtered []string
+				for _, method := range unusedMethods {
+					if _, ok := ignoreSet[method]; !ok {
+						filtered = append(filtered, method)
+					}
+				}
+				unusedMethods = filtered
+			}
+
+			for _, method := range unusedMethods {
+				fmt.Println(method)
+			}
+
+			if len(unusedMethods) > 0 && *fail {
+				os.Exit(1)
+			}
+
+			return nil
 		},
 	}
+	fail = c.Flags().Bool("fail", false, "Exit with non-zero status if unused methods are found")
+	c.Flags().StringSliceVar(&ignoreMethods, "ignore", nil, "Methods to ignore check (comma-separated)")
+	return c
 }
 
-func run(ctx context.Context, pkgPath, structName, pjPath string) error {
-	// � 分析対象
+func search(ctx context.Context, pkgPath, structName string) ([]string, error) {
 	targetPkgPath := pkgPath       // ← struct が定義されている完全パス
 	targetStructName := structName // ← struct 名
-	analyzePath := pjPath          // ← 呼び出し調査範囲
 
-	// �🧠 全体読み込み（呼び出し調査用）
-	cfg := &packages.Config{
-		Mode: packages.NeedName | packages.NeedSyntax | packages.NeedTypes | packages.NeedTypesInfo | packages.NeedImports | packages.NeedDeps,
-		Fset: token.NewFileSet(),
-		Env:  os.Environ(),
-	}
-	allPkgs, err := packages.Load(cfg, analyzePath)
+	pkgs, err := packages.Load(
+		&packages.Config{
+			Mode: packages.NeedName | packages.NeedSyntax | packages.NeedTypes | packages.NeedTypesInfo | packages.NeedImports | packages.NeedDeps,
+			Fset: token.NewFileSet(),
+			Env:  os.Environ(),
+		},
+		"./...",
+	)
 	if err != nil {
-		log.Fatal(err)
-	}
-	if packages.PrintErrors(allPkgs) > 0 {
-		log.Fatal("load error")
+		return nil, err
 	}
 
-	// 🎯 struct の定義元パッケージを特定
-	var targetStructObj *types.TypeName
-	for _, pkg := range allPkgs {
-		fmt.Printf("Analyzing package: %s\n", pkg.PkgPath)
-		if pkg.PkgPath != targetPkgPath {
-			continue
-		}
-		obj := pkg.Types.Scope().Lookup(targetStructName)
-		if obj == nil {
-			log.Fatalf("Struct %s not found in package %s", targetStructName, targetPkgPath)
-		}
-		named, ok := obj.Type().(*types.Named)
-		if !ok {
-			log.Fatalf("%s is not a named type", targetStructName)
-		}
-		targetStructObj = named.Obj()
-		break
-	}
-	if targetStructObj == nil {
-		log.Fatalf("Struct definition for %s not found", targetStructName)
+	methods, err := listMethods(pkgs, targetPkgPath, targetStructName)
+	if err != nil {
+		return nil, err
 	}
 
-	// 📚 メソッド一覧取得
-	methodSet := types.NewMethodSet(types.NewPointer(targetStructObj.Type()))
-	// methodSet := types.NewMethodSet(targetStructObj.Type())
-	methodMap := map[string]*types.Func{}
 	calledMethods := map[string]bool{}
 
-	fmt.Printf("Analyzing methods for struct: %s.%s\n", targetPkgPath, targetStructName)
-	fmt.Printf("methodSet.Len() = %d\n", methodSet.Len())
-
-	for i := 0; i < methodSet.Len(); i++ {
-		sel := methodSet.At(i)
-		fn := sel.Obj().(*types.Func)
-		methodMap[fn.Name()] = fn
-		fmt.Printf("Found method: %s.%s\n", targetStructName, fn.Name())
-	}
-
 	// 🔍 すべてのパッケージからメソッド呼び出しを探索
-	for _, pkg := range allPkgs {
+	for _, pkg := range pkgs {
 		info := pkg.TypesInfo
 
 		for _, file := range pkg.Syntax {
@@ -131,59 +124,17 @@ func run(ctx context.Context, pkgPath, structName, pjPath string) error {
 		}
 	}
 
-	// 📤 未使用メソッドの出力
-	fmt.Println("Unused methods:")
-	for name := range methodMap {
+	var unusedMethods []string
+	for _, name := range methods {
 		if !calledMethods[name] {
-			fmt.Printf("- %s\n", name)
+			unusedMethods = append(unusedMethods, name)
 		}
 	}
 
-	return nil
-
-	// methods, err := getStructMethods(pkgPath, structName)
-	// if err != nil {
-	// 	return fmt.Errorf("failed to get struct methods: %w", err)
-	// }
-
-	// fmt.Printf("Found %d methods for struct %s:\n", len(methods), structName)
-	// for _, method := range methods {
-	// 	fmt.Printf("- %s\n", method)
-	// }
-
-	// usedMethods, err := findUsedMethods(pjPath, structName, methods)
-	// if err != nil {
-	// 	return fmt.Errorf("failed to find used methods: %w", err)
-	// }
-
-	// unusedMethods := []StructMethod{}
-	// for _, method := range methods {
-	// 	found := false
-	// 	for _, used := range usedMethods {
-	// 		if method == used {
-	// 			found = true
-	// 			break
-	// 		}
-	// 	}
-	// 	if !found {
-	// 		unusedMethods = append(unusedMethods, method)
-	// 	}
-	// }
-
-	// fmt.Printf("\nUsed methods (%d):\n", len(usedMethods))
-	// for _, method := range usedMethods {
-	// 	fmt.Printf("✓ %s\n", method)
-	// }
-
-	// fmt.Printf("\nUnused methods (%d):\n", len(unusedMethods))
-	// for _, method := range unusedMethods {
-	// 	fmt.Printf("✗ %s\n", method)
-	// }
-
-	// return nil
+	return unusedMethods, nil
 }
 
-// 🔧 ヘルパー: *T or T → T
+// *T|T -> T
 func deref(t types.Type) types.Type {
 	if ptr, ok := t.(*types.Pointer); ok {
 		return ptr.Elem()
@@ -191,126 +142,45 @@ func deref(t types.Type) types.Type {
 	return t
 }
 
-type StructMethod struct {
-	PackageName  string
-	ReceiverName string
-	MethodName   string
-}
-
-func (m StructMethod) String() string {
-	return fmt.Sprintf("%s.%s.%s", m.PackageName, m.ReceiverName, m.MethodName)
-}
-
-func getStructMethods(pkgPath, structName string) ([]StructMethod, error) {
-	var methods []StructMethod
-
-	if err := filepath.Walk(pkgPath, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
+func listMethods(pkgs []*packages.Package, pkgPath, structName string) ([]string, error) {
+	var targetStructObj *types.TypeName
+	for _, pkg := range pkgs {
+		if pkg.PkgPath != pkgPath {
+			continue
 		}
-
-		if !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
-			return nil
+		obj := pkg.Types.Scope().Lookup(structName)
+		if obj == nil {
+			return nil, fmt.Errorf("struct %s not found in package %s", structName, pkgPath)
 		}
-
-		fset := token.NewFileSet()
-		node, err := parser.ParseFile(fset, path, nil, parser.ParseComments)
-		if err != nil {
-			return err
+		named, ok := obj.Type().(*types.Named)
+		if !ok {
+			return nil, fmt.Errorf("%s is not a named type", structName)
 		}
-
-		ast.Inspect(node, func(n ast.Node) bool {
-			switch x := n.(type) {
-			case *ast.FuncDecl:
-				if x.Recv != nil && len(x.Recv.List) > 0 {
-					recv := x.Recv.List[0]
-					var recvTypeName string
-
-					switch t := recv.Type.(type) {
-					case *ast.StarExpr:
-						if ident, ok := t.X.(*ast.Ident); ok {
-							recvTypeName = ident.Name
-						}
-					case *ast.Ident:
-						recvTypeName = t.Name
-					}
-
-					slog.Debug(
-						"method decl",
-						slog.Any("recv name", recvTypeName),
-						slog.Any("method name", x.Name.Name),
-					)
-
-					if recvTypeName == structName {
-						methods = append(methods, StructMethod{
-							PackageName:  node.Name.Name,
-							ReceiverName: recvTypeName,
-							MethodName:   x.Name.Name,
-						})
-					}
-				}
-			}
-			return true
-		})
-
-		return nil
-	}); err != nil {
-		return nil, err
+		targetStructObj = named.Obj()
+		break
+	}
+	if targetStructObj == nil {
+		return nil, fmt.Errorf("struct %s not found", structName)
 	}
 
-	return methods, nil
-}
+	var methods []string
 
-func findUsedMethods(pjPath, structName string, methods []StructMethod) ([]StructMethod, error) {
-	var usedMethods []StructMethod
-	methodSet := make(map[string]bool)
-	for _, method := range methods {
-		methodSet[method.String()] = false
+	// *T methods
+	ptrRcvMethodSet := types.NewMethodSet(types.NewPointer(targetStructObj.Type()))
+	for i := 0; i < ptrRcvMethodSet.Len(); i++ {
+		sel := ptrRcvMethodSet.At(i)
+		fn := sel.Obj().(*types.Func)
+		methods = append(methods, fn.Name())
 	}
 
-	if err := filepath.Walk(pjPath, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-
-		if !strings.HasSuffix(path, ".go") {
-			return nil
-		}
-
-		fset := token.NewFileSet()
-		node, err := parser.ParseFile(fset, path, nil, parser.ParseComments)
-		if err != nil {
-			return err
-		}
-
-		ast.Inspect(node, func(n ast.Node) bool {
-			switch x := n.(type) {
-			case *ast.CallExpr:
-				if selector, ok := x.Fun.(*ast.SelectorExpr); ok {
-					methodName := selector.Sel.Name
-
-					for _, method := range methods {
-						if method.MethodName == methodName {
-							if !methodSet[method.String()] {
-								methodSet[method.String()] = true
-								usedMethods = append(usedMethods, method)
-								slog.Debug(
-									"found method usage",
-									slog.Any("method", method.String()),
-									slog.Any("file", path),
-								)
-							}
-						}
-					}
-				}
-			}
-			return true
-		})
-
-		return nil
-	}); err != nil {
-		return nil, err
+	// T methods
+	valueRcvMethodSet := types.NewMethodSet(targetStructObj.Type())
+	for i := 0; i < valueRcvMethodSet.Len(); i++ {
+		sel := valueRcvMethodSet.At(i)
+		fn := sel.Obj().(*types.Func)
+		methods = append(methods, fn.Name())
 	}
 
-	return usedMethods, nil
+	slices.Sort(methods)
+	return slices.Compact(methods), nil
 }
