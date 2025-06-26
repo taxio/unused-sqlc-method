@@ -26,7 +26,7 @@ func cmd() *cobra.Command {
 		ignoreMethods []string
 	)
 	c := &cobra.Command{
-		Use:  "unused-sqlc-method [target package path] [target struct name]",
+		Use:  "tmp [target package path] [target struct name]",
 		Args: cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			unusedMethods, err := search(cmd.Context(), args[0], args[1])
@@ -66,9 +66,6 @@ func cmd() *cobra.Command {
 }
 
 func search(ctx context.Context, pkgPath, structName string) ([]string, error) {
-	targetPkgPath := pkgPath       // ← struct が定義されている完全パス
-	targetStructName := structName // ← struct 名
-
 	pkgs, err := packages.Load(
 		&packages.Config{
 			Mode: packages.NeedName | packages.NeedSyntax | packages.NeedTypes | packages.NeedTypesInfo | packages.NeedImports | packages.NeedDeps,
@@ -81,14 +78,13 @@ func search(ctx context.Context, pkgPath, structName string) ([]string, error) {
 		return nil, err
 	}
 
-	methods, err := listMethods(pkgs, targetPkgPath, targetStructName)
+	methods, err := listMethods(pkgs, pkgPath, structName)
 	if err != nil {
 		return nil, err
 	}
 
 	calledMethods := map[string]bool{}
 
-	// 🔍 すべてのパッケージからメソッド呼び出しを探索
 	for _, pkg := range pkgs {
 		info := pkg.TypesInfo
 
@@ -115,8 +111,7 @@ func search(ctx context.Context, pkgPath, structName string) ([]string, error) {
 					return true
 				}
 
-				if named.Obj().Name() == targetStructName && named.Obj().Pkg() != nil && named.Obj().Pkg().Path() == targetPkgPath {
-					// 一致する struct のメソッド呼び出し
+				if named.Obj().Name() == structName && named.Obj().Pkg() != nil && named.Obj().Pkg().Path() == pkgPath {
 					calledMethods[fn.Name()] = true
 				}
 				return true
